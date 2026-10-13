@@ -493,7 +493,14 @@ func (r *Runner) handleOutput(wg *sizedwaitgroup.SizedWaitGroup) {
 	var results []HttpResult
 	for result := range r.result {
 		results = append(results, result)
-		r.writeResult(f, result)
+		if !r.Options.JSON {
+			r.writeResult(f, result)
+		}
+	}
+	if r.Options.JSON {
+		r.writeJSONResults(f, results)
+		r.reportScanScore(results)
+		return
 	}
 	// summary table
 	if len(results) > 0 {
@@ -549,16 +556,61 @@ func (r *Runner) handleOutput(wg *sizedwaitgroup.SizedWaitGroup) {
 		}
 	}
 
-	if r.Options.Callback != nil {
-		advies := make([]vulstruct.Info, 0)
-		for _, item := range results {
-			for _, ad := range item.Advisories {
-				advies = append(advies, ad.Info)
-			}
-		}
-		score := r.CalcSecScore(advies)
-		r.Options.Callback(score)
+	r.reportScanScore(results)
+}
+
+// writeJSONResults writes the collected results using the existing HttpResult schema.
+// Human-readable lines stay the default; this path is used only when JSON output is requested.
+func (r *Runner) writeJSONResults(f *os.File, results []HttpResult) {
+	payload := ResultsJSON(results) + "\n"
+	fmt.Print(payload)
+	if f != nil {
+		_, _ = f.WriteString(payload)
 	}
+	for _, result := range results {
+		r.callbackScanResult(result)
+	}
+}
+
+func (r *Runner) callbackScanResult(result HttpResult) {
+	if r.Options.Callback == nil {
+		return
+	}
+	vuls := make([]vulstruct.Info, 0, len(result.Advisories))
+	for _, item := range result.Advisories {
+		vuls = append(vuls, item.Info)
+	}
+	var fpString string
+	for _, fp := range result.Fingers {
+		fpString += fp.Name
+		if fp.Type != "" {
+			fpString += ":" + fp.Type
+		}
+		if fp.Version != "" {
+			fpString += ":" + fp.Version
+		}
+	}
+	r.Options.Callback(CallbackScanResult{
+		TargetURL:       result.URL,
+		StatusCode:      result.StatusCode,
+		Title:           result.Title,
+		Fingerprint:     fpString,
+		Vulnerabilities: vuls,
+		Resp:            result.Resp,
+	})
+}
+
+func (r *Runner) reportScanScore(results []HttpResult) {
+	if r.Options.Callback == nil {
+		return
+	}
+	advies := make([]vulstruct.Info, 0)
+	for _, item := range results {
+		for _, ad := range item.Advisories {
+			advies = append(advies, ad.Info)
+		}
+	}
+	r.Options.Callback(r.CalcSecScore(advies))
 }
 
 // createOutputFile 创建输出文件
@@ -575,32 +627,7 @@ func (r *Runner) writeResult(f *os.File, result HttpResult) {
 	if f != nil {
 		_, _ = f.WriteString(result.s + "\n")
 	}
-	if r.Options.Callback != nil {
-		vuls := make([]vulstruct.Info, 0)
-		for _, item := range result.Advisories {
-			vuls = append(vuls, item.Info)
-		}
-		var fpString string = ""
-		for _, fp := range result.Fingers {
-			fpString += fp.Name
-			if fp.Type != "" {
-				fpString += ":" + fp.Type
-			}
-			if fp.Version != "" {
-				fpString += ":" + fp.Version
-			}
-		}
-		if r.Options.Callback != nil {
-			r.Options.Callback(CallbackScanResult{
-				TargetURL:       result.URL,
-				StatusCode:      result.StatusCode,
-				Title:           result.Title,
-				Fingerprint:     fpString,
-				Vulnerabilities: vuls,
-				Resp:            result.Resp,
-			})
-		}
-	}
+	r.callbackScanResult(result)
 	if len(result.Advisories) > 0 {
 		fmt.Println("\n存在漏洞:")
 		for _, item := range result.Advisories {
@@ -608,11 +635,12 @@ func (r *Runner) writeResult(f *os.File, result HttpResult) {
 			builderFile := strings.Builder{}
 			serverity := item.Info.Severity
 			name := item.Info.CVEName
-			if serverity == "HIGH" || serverity == "CRITICAL" {
+			switch normalizeSeverity(serverity) {
+			case SeverityHigh:
 				builder.WriteString(aurora.Red(fmt.Sprintf("%s [%s]", name, serverity)).String()) // 高危红色
-			} else if serverity == "MEDIUM" {
+			case SeverityMedium:
 				builder.WriteString(aurora.Yellow(fmt.Sprintf("%s [%s]", name, serverity)).String()) // 中危黄色
-			} else {
+			default:
 				builder.WriteString(aurora.Bold(fmt.Sprintf("%s [%s]", name, serverity)).String()) // 低危加粗
 			}
 			builderFile.WriteString(fmt.Sprintf("%s [%s]\n", name, serverity))
@@ -698,17 +726,48 @@ func (r *Runner) initVulnerabilityDB() error {
 	return nil
 }
 
+// Severity buckets. Every severity string produced by the rule data has to be
+// classified into one of these, and the set of spellings that can occur is the
+// one cmd/yamlcheck accepts (isValidSeverity) - see normalizeSeverity.
+const (
+	SeverityHigh    = "high"
+	SeverityMedium  = "medium"
+	SeverityLow     = "low"
+	SeverityUnknown = "unknown"
+)
+
+// normalizeSeverity classifies a severity string into one of the Severity*
+// buckets above.
+//
+// It accepts every spelling that the data validator accepts
+// (cmd/yamlcheck/main.go isValidSeverity), in any case and with surrounding
+// space: the ASCII levels, their Chinese aliases, and "unknown". The two must
+// agree, because the validator is what decides which rule files may ship, and
+// this is what decides how they are counted and reported.
+func normalizeSeverity(severity string) string {
+	switch strings.ToLower(strings.TrimSpace(severity)) {
+	case "critical", "high", "高危", "严重", "高", "危急":
+		return SeverityHigh
+	case "medium", "中危", "中等":
+		return SeverityMedium
+	case "low", "info", "低", "信息":
+		return SeverityLow
+	default:
+		return SeverityUnknown
+	}
+}
+
 // CalcSecScore 计算安全分数
 func (r *Runner) CalcSecScore(advisories []vulstruct.Info) CallbackReportInfo {
 	var total, high, middle, low int = 0, 0, 0, 0
 	total = len(advisories)
 	for _, item := range advisories {
-		severity := strings.ToLower(strings.TrimSpace(item.Severity))
-		if severity == "high" || severity == "critical" || severity == "高危" || severity == "严重" {
+		switch normalizeSeverity(item.Severity) {
+		case SeverityHigh:
 			high++
-		} else if severity == "medium" || severity == "中危" {
+		case SeverityMedium:
 			middle++
-		} else {
+		default:
 			low++
 		}
 	}

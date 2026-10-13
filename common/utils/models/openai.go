@@ -163,7 +163,7 @@ func (ai *OpenAI) ChatStream(ctx context.Context, history []map[string]string) <
 				Seed:     openai.Int(24),
 				Model:    ai.Model,
 			})
-			streamErr := false
+			emitted := false
 			for stream.Next() {
 				evt := stream.Current()
 				if len(evt.Choices) > 0 {
@@ -172,15 +172,27 @@ func (ai *OpenAI) ChatStream(ctx context.Context, history []map[string]string) <
 						totalToken = evt.Usage.TotalTokens
 					}
 					resp <- word
+					if word != "" {
+						emitted = true
+					}
 				}
 			}
 			if stream.Err() != nil {
+				if emitted {
+					// Deltas already handed to the caller cannot be taken back.
+					// Retrying from scratch would replay the whole response on top
+					// of the partial text the consumer already accumulated, so a
+					// mid-stream failure after partial output is terminal (#693).
+					gologger.WithError(stream.Err()).Errorf("ChatStream failed mid-stream after partial output; aborting without retry to avoid duplicated content (attempt %d/%d)", attempt+1, maxRetries)
+					if totalToken > 0 {
+						ai.UseToken += totalToken
+					}
+					return
+				}
 				gologger.WithError(stream.Err()).Errorf("ChatStream error (attempt %d/%d)", attempt+1, maxRetries)
-				streamErr = true
+				continue
 			}
-			if !streamErr {
-				break
-			}
+			break
 		}
 		if totalToken > 0 {
 			ai.UseToken += totalToken
@@ -232,6 +244,11 @@ func (ai *OpenAI) ChatWithImage(ctx context.Context, prompt string, imagePath st
 	if err != nil {
 		return "", err
 	}
+	// 网关可能返回 200 但 choices 为空（内容过滤命中、上游错误被包装成 200），
+	// 与 Vaild 保持一致：这是错误，不是 panic。
+	if len(completion.Choices) == 0 {
+		return "", errors.New("no response")
+	}
 	return completion.Choices[0].Message.Content, nil
 }
 
@@ -257,6 +274,11 @@ func (ai *OpenAI) ChatWithImageByte(ctx context.Context, prompt string, imageDat
 	completion, err := client.Chat.Completions.New(ctx, params)
 	if err != nil {
 		return "", err
+	}
+	// 网关可能返回 200 但 choices 为空（内容过滤命中、上游错误被包装成 200），
+	// 与 Vaild 保持一致：这是错误，不是 panic。
+	if len(completion.Choices) == 0 {
+		return "", errors.New("no response")
 	}
 	return completion.Choices[0].Message.Content, nil
 }
